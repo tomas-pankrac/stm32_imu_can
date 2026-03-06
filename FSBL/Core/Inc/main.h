@@ -125,17 +125,17 @@ void Error_Handler(void);
 #define LIS2MDL_TEMP_OUT_H_REG          0x6FU
 
 typedef struct __attribute__((packed)) {
-  int16_t accel_x;
-  int16_t accel_y;
-  int16_t accel_z;
-
-  int16_t gyro_x;
-  int16_t gyro_y;
-  int16_t gyro_z;
-
-  int16_t mag_x;
-  int16_t mag_y;
-  int16_t mag_z;
+//  int16_t accel_x;
+//  int16_t accel_y;
+//  int16_t accel_z;
+//
+//  int16_t gyro_x;
+//  int16_t gyro_y;
+//  int16_t gyro_z;
+//
+//  int16_t mag_x;
+//  int16_t mag_y;
+//  int16_t mag_z;
 
   float_t euler_x;
   float_t euler_y;
