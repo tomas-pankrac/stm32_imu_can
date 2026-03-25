@@ -1,8 +1,8 @@
 #include "stdio.h"
 #include <math.h>
 #include "arm_math.h"
+#include "kalman.h"
 
-const float dt = 0.005;
 float32_t ang[3];
 float32_t Cbw[3][3];
 float32_t Cwb[3][3];
@@ -12,15 +12,13 @@ float32_t Ry[3][3];
 float32_t Rz[3][3];
 float32_t Rxy[3][3];
 float32_t Ryz[3][3];
-float var_A = 1e-5;
-float var_W = 1e-5;
 float32_t Q[18][18];
 float32_t F[18][18];
 float32_t Ft[18][18];
 float32_t P[18][18];
 float32_t Pp[18][18];
 float32_t FP[18][18];
-float32_t G[18][18];
+float32_t G[18][3];
 //int fs[4];
 //float var_R =  1e-5;
 //float var_V = 1e-5;
@@ -29,6 +27,7 @@ float32_t H[24][18];
 float32_t Ht[18][24];
 float32_t HPp[24][18];
 float32_t HPpHt[24][24];
+float32_t HPpHtR[24][24];
 float32_t HPpHtI[24][24];
 float32_t PpHt[18][24];
 float32_t K[18][24];
@@ -70,6 +69,7 @@ arm_matrix_instance_f32 H_inst;
 arm_matrix_instance_f32 Ht_inst;
 arm_matrix_instance_f32 HPp_inst;
 arm_matrix_instance_f32 HPpHt_inst;
+arm_matrix_instance_f32 HPpHtR_inst;
 arm_matrix_instance_f32 HPpHtI_inst;
 arm_matrix_instance_f32 PpHt_inst;
 arm_matrix_instance_f32 K_inst;
@@ -137,7 +137,7 @@ void init_matrices() {
     cols = 18;
     arm_mat_init_f32(&G_inst, rows, cols, (float32_t *)G);
     rows = 24;
-    cols = 24;
+    cols = 3;
     arm_mat_init_f32(&R_inst, rows, cols, (float32_t *)R);
     rows = 24;
     cols = 18;
@@ -151,6 +151,9 @@ void init_matrices() {
     rows = 24;
     cols = 24;
     arm_mat_init_f32(&HPpHt_inst, rows, cols, (float32_t *)HPpHt);
+    rows = 24;
+    cols = 24;
+    arm_mat_init_f32(&HPpHtR_inst, rows, cols, (float32_t *)HPpHtR);
     rows = 24;
     cols = 24;
     arm_mat_init_f32(&HPpHtI_inst, rows, cols, (float32_t *)HPpHtI);
@@ -193,6 +196,30 @@ void init_matrices() {
 //    rows = 3;
 //    cols = 4;
 //    arm_mat_init_f32(&ep_vel_inst, rows, cols, (float32_t *)ep_vel);
+    init_P_Pp();
+}
+
+void gen_F(float32_t dt){
+    for(uint8_t i=0; i<18; i++){
+        F[i][i] = 1.0;
+    }
+    for(uint8_t i=0; i<3; i++){
+        F[i][i+3] = dt;
+    }
+}
+
+void gen_G(float32_t dt){
+    for(uint8_t i=0; i<3; i++){
+        G[i][i] = 0.5 * dt * dt;
+        G[i+3][i] = dt;
+    }
+}
+
+void init_P_Pp(){
+    for(uint8_t i=0; i<18; i++){
+        P[i][i] = 1;
+        Pp[i][i] = 1;
+    }
 }
 
 void rot_matrices(float32_t ang[3], 
@@ -252,7 +279,7 @@ void gen_H(float32_t H[24][18],
             for(k=0; k<3; k++){
                 H[i*3 + j][k] = Cwbn[j][k];
                 H[i*3 + j][6+i*3 + k] = Cwb[j][k];
-                H[(i+4)*3 + j][(i+4+1)*3 + k] = Cwbn[j][k];
+                H[(i+4)*3 + j][3 + k] = Cwbn[j][k];
             }
         }
     }
@@ -295,10 +322,10 @@ void gen_Q(float32_t Q[18][18],
     }
 
     for(i=0; i<3; i++){
-        Q[i][i] = pow(dt, 4) / 4 * var_Axyz;
-        Q[i][i+3] = pow(dt, 3) / 2  * var_Axyz;
-        Q[i+3][i] = pow(dt, 3) / 2 * var_Axyz;
-        Q[i+3][i+3] = pow(dt, 2) * var_Axyz;
+        Q[i][i] = (dt * dt * dt * dt) / 4 * var_Axyz;
+        Q[i][i+3] = (dt * dt * dt) / 2  * var_Axyz;
+        Q[i+3][i] = (dt * dt * dt) / 2 * var_Axyz;
+        Q[i+3][i+3] = (dt * dt) * var_Axyz;
     }
     for(i=6; i<18; i++){
         Q[i][i] *= var_Wxyz;
@@ -323,17 +350,20 @@ void calculate_K(arm_matrix_instance_f32* H_inst,
                  arm_matrix_instance_f32* HPp_inst, 
                  arm_matrix_instance_f32* Ht_inst, 
                  arm_matrix_instance_f32* HPpHt_inst, 
+                 arm_matrix_instance_f32* HPpHtR_inst,
                  arm_matrix_instance_f32* HPpHtI_inst, 
                  arm_matrix_instance_f32* PpHt_inst,  
                  arm_matrix_instance_f32* K_inst){
 
-    arm_mat_mult_f32(H_inst, Pp_inst, HPp_inst);
-    arm_mat_trans_f32(H_inst, Ht_inst);
-    arm_mat_mult_f32(HPp_inst, Ht_inst, HPpHt_inst);
-    arm_mat_add_f32(HPpHt_inst, R_inst, HPpHt_inst);
-    arm_mat_inverse_f32(HPpHt_inst, HPpHtI_inst);
-    arm_mat_mult_f32(Pp_inst, Ht_inst, PpHt_inst);
-    arm_mat_mult_f32(PpHt_inst, HPpHtI_inst, K_inst);
+    arm_status status;
+
+    status = arm_mat_mult_f32(H_inst, Pp_inst, HPp_inst);
+    status = arm_mat_trans_f32(H_inst, Ht_inst);
+    status = arm_mat_mult_f32(HPp_inst, Ht_inst, HPpHt_inst);
+    status = arm_mat_add_f32(HPpHt_inst, R_inst, HPpHtR_inst);
+    status = arm_mat_inverse_f32(HPpHtR_inst, HPpHtI_inst);
+    status = arm_mat_mult_f32(Pp_inst, Ht_inst, PpHt_inst);
+    status = arm_mat_mult_f32(PpHt_inst, HPpHtI_inst, K_inst);
 }
 
 void calculate_P(arm_matrix_instance_f32* K_inst, 
@@ -404,13 +434,19 @@ void step(float32_t ang[3],
           uint8_t fs[4],
           float32_t var_R,
           float32_t var_V,
+          float32_t var_A,
+          float32_t var_W,
           float32_t ep[4][3],
-          float32_t ep_vel[4][3]){
-               
+          float32_t ep_vel[4][3],
+          float32_t accel[3],
+          float32_t dt){
+    gen_F(dt);
+    gen_G(dt);
+    gen_Q(Q, var_A, var_W, dt);
     rot_matrices(ang, Rz, Ry, Rx, &Rx_inst, &Ry_inst, &Rz_inst, &Rxy_inst, &Ryz_inst, &Cbw_inst, &Cwb_inst);
     gen_H(H, Cwb, Cwbn, &Cwb_inst, &Cwbn_inst);
     gen_R(fs, R, var_R, var_V);
-    calculate_K(&H_inst, &Pp_inst, &R_inst, &HPp_inst, &Ht_inst, &HPpHt_inst, &HPpHtI_inst, &PpHt_inst, &K_inst);
+    calculate_K(&H_inst, &Pp_inst, &R_inst, &HPp_inst, &Ht_inst, &HPpHt_inst, &HPpHtR_inst, &HPpHtI_inst, &PpHt_inst, &K_inst);
     update_zn(zn, ep, ep_vel);
     calculate_xn(xn, xnp, &K_inst, zn, &H_inst, Hxnp, KznHxnp);
     calculate_P(&K_inst, &KH_inst, &H_inst, &I_inst, &IKH_inst, &IKHt_inst, &IKHPp_inst, &Pp_inst, &R_inst, &KR_inst, &IKHPpIKHt_inst, &KRKt_inst, &Kt_inst, &P_inst);

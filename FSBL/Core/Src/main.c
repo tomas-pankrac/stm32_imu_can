@@ -49,10 +49,14 @@
 #define CLK_WAIT 0x1FU
 #define SAMPLE_RATE (833) // replace with actual sample rate
 
-#define ACCELEROMETER_CONSTANT (16.0 / 65536)
-#define GYROSCOPE_CONSTANT (4000.0 / 65536)
+#define ACCELEROMETER_CONSTANT ((double_t) 16.0 / 65536)
+#define GYROSCOPE_CONSTANT ((double_t) 4000.0 / 65536)
 #define MAGNETOMETER_CONSTANT (0.15)
-#define ADC_CONSTANT (21.4 / 1.4 / 4096 * 3.3)
+#define ADC_CONSTANT ((double_t) 21.4 / 1.4 / 4096 * 3.3)
+
+
+
+
 
 /* USER CODE END PD */
 
@@ -80,6 +84,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
+TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim9;
 
 XSPI_HandleTypeDef hxspi2;
@@ -107,6 +112,7 @@ static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM9_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -124,8 +130,8 @@ FDCAN_HandleTypeDef hfdcan3;
 uint8_t TX_Buffer[16];
 uint8_t RX_Buffer[16];
 
-uint8_t TX_Buffer_1[256];
-uint8_t RX_Buffer_1[256];
+uint8_t TX_Buffer_1[512];
+uint8_t RX_Buffer_1[512];
 
 float_t position_estimates[12];
 float_t velocity_estimates[12];
@@ -161,9 +167,11 @@ uint32_t previousTimestamp;
 float_t deltaTime;
 
 int16_t accelerometer_data[3];
+double_t acceleration[3];
 int16_t gyroscope_data[3];
 int16_t magnetometer_data[3];
 float_t euler_orientation[3];
+double_t omega[3];
 
 float32_t battery_voltage;
 
@@ -172,17 +180,31 @@ FDCAN_RxHeaderTypeDef RxHeader;
 uint8_t CAN_TxData[8];
 uint8_t CAN_RxData[8];
 uint32_t CAN_Received_Datas[24];
-uint32_t CAN_Received_Datas_Estimates[24];
+uint32_t CAN_Command_Datas[24];
 uint32_t TxMailbox;
 uint8_t can_timeout_flags;
 uint8_t send_can_command_flag = 0;
 uint32_t error_codes[12];
 uint8_t can_state_machine=1;
+uint8_t heartbeat_receive_counter=0;
 
 float32_t forces[12] = {20,0,0,20,0,0,20,0,0,20,0,0};
+float32_t position_targets[24] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+uint8_t foot_scheduler[4] = {0,0,0,0};
+int8_t foot_scheduler_diff[4] = {0,0,0,0};
+float32_t body_velocity_estimate[3] = {0,0,0};
+uint8_t new_calculated_data_received=0;
+uint8_t new_calculated_data_buffer[100];
+uint8_t new_calculated_data_counter=0;
+float32_t foot_step_landing_locations[12]={};
+float32_t shoulder_vectors[12] = {0.2, 0.065, 0,-0.2, 0.065, 0,0.2, -0.065, 0,-0.2, -0.065, 0,};
+float32_t lift_leg_trajectory[15][12];
+float32_t lift_leg_trajectory_angles[15][12];
+uint8_t lift_leg_index = 0;
+uint32_t lift_leg_timer_counter = 20000;
 
-CAN_Packet can_packet = {0x9, 1, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
-const CAN_Packet can_packet_estimates = {0x9, 1, 8, {0, 0, 0, 0, 0, 0, 0, 0}};
+CAN_Packet can_packet_command = {0x9, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+CAN_Packet can_packet_estimates = {0x9, 1, 8, {0, 0, 0, 0, 0, 0, 0, 0}};
 
 HAL_StatusTypeDef status;
 
@@ -214,6 +236,8 @@ FusionAhrs ahrs;
 uint8_t fs[4] = {1, 1, 1, 1};
 float32_t var_R = 1e-5;
 float32_t var_V = 1e-5;
+float32_t var_A = 1e-5;
+float32_t var_W = 1e-5;
 
 float32_t leg_angles[12] = {0.1, 0.8, -1.59, 0.1, 0.8, -1.59, 0.1, 0.8, -1.59, 0.1, 0.8, -1.59};
 
@@ -222,7 +246,21 @@ volatile uint8_t estimates_flag = 0;
 uint32_t sync1_time = 0;
 uint32_t sync2_time = 0;
 
-uint32_t estimates_flag_counter = 0;
+TX_Data_t data;
+
+uint8_t performance_mode = 0;
+
+uint8_t parsed_command = 0;
+uint8_t parsed_data_size = 0;
+
+uint8_t estop = 0;
+
+uint8_t parsed_control_mode = CONTROL_MODE_POSITION;
+uint8_t parsed_axis_state = AXIS_STATE_IDLE;
+uint8_t parsed_input_mode = INPUT_MODE_PASSTHROUGH;
+uint8_t control_mode = 0;
+uint8_t axis_state = 0;
+
 
 /* USER CODE END 0 */
 
@@ -252,6 +290,10 @@ int main(void)
   /* USER CODE BEGIN Init */
     SystemInit();
     init_matrices();
+    gen_F(0.005);
+    gen_G(0.005);
+    gen_Q(Q, var_A, var_W, 0.005);
+    calculate_Pp(&F_inst, &Ft_inst, &P_inst, &FP_inst, &Q_inst, &Pp_inst);
     init_ep_matrices();
 
   /* USER CODE END Init */
@@ -282,14 +324,16 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM5_Init();
   MX_TIM9_Init();
+  MX_TIM6_Init();
   SystemIsolation_Config();
   /* USER CODE BEGIN 2 */
 
     HAL_TIM_Base_Start_IT(&htim2);
     HAL_TIM_Base_Start_IT(&htim4);
     HAL_TIM_Base_Start_IT(&htim5);
+    HAL_TIM_Base_Start_IT(&htim6);
     HAL_TIM_Base_Start_IT(&htim9);
-//    HAL_TIM_Base_Start_IT(&htim3);
+    //    HAL_TIM_Base_Start_IT(&htim3);
 
     initialize_imu_mag(&hspi5, TX_Buffer, RX_Buffer);
 
@@ -311,9 +355,12 @@ int main(void)
     handle_GPDMA1_Channel0.Init.Request = GPDMA1_REQUEST_SPI1_RX;
     handle_GPDMA1_Channel1.Init.Request = GPDMA1_REQUEST_SPI1_TX;
 
-    run_leg_angle_calibration(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3, &estimates_flag);
-    run_leg_angle_calibration(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3, &estimates_flag);
-    run_leg_angle_calibration(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3, &estimates_flag);
+    reboot_odrives(&hfdcan1, &hfdcan2, &hfdcan3, &TxHeader, CAN_TxData);
+
+    run_leg_angle_calibration(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_estimates, &TxHeader, CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3, &estimates_flag);
+
+    can_packet_command.id = 0xe;
+    can_packet_command.RTR = 0;
 
     HAL_Delay(100);
   /* USER CODE END 2 */
@@ -322,36 +369,41 @@ int main(void)
   /* USER CODE BEGIN WHILE */
     while (1) {
 
+        // Set test gpios from triggering
         HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
+//        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
 
+        // Zero estimates flag and timers
+        uint8_t update_position_targets = 0;
         estimates_flag = 0;
         TIM5->CNT = 0;
         TIM9->CNT = 0;
-        estimates_flag_counter = 0;
 
+        // Prepare for motor position and velocity estimates
+        can_packet_estimates.id = 0x9;
+        can_packet_estimates.RTR = 0x1;
+        can_packet_estimates.data_size = 0x8;
 
-        if (send_can_command_flag){
-            can_timeout_flags = send_can_command_to_all_controllers(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, &CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3);
-        } else {
-            can_timeout_flags = get_estimates(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, &CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas_Estimates, error_codes, &htim3);
-            TIM3->CNT = 1;
-            hfdcan1.Instance->TXBAR = 0x00000003;
-            hfdcan2.Instance->TXBAR = 0x00000003;
-            hfdcan3.Instance->TXBAR = 0x00000003;
-        }
+        // Readout motor position and velocity estimates
+        can_timeout_flags = get_estimates(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_estimates, &TxHeader, &CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3);
+        TIM3->CNT = 1;
+        hfdcan1.Instance->TXBAR = 0x00000003;
+        hfdcan2.Instance->TXBAR = 0x00000003;
+        hfdcan3.Instance->TXBAR = 0x00000003;
 
-//        uint32_t estimates_count = TIM5->CNT;
-
+        // Readout accelerometer, gyroscope and magnetometer data
         readout_imu(&hspi5, TX_Buffer, RX_Buffer, accelerometer_data, gyroscope_data, magnetometer_data, &previousTimestamp, &timestamp, &deltaTime, &mag_temp);
 
-//        uint32_t imu_count = TIM5->CNT;
-
+        // Update orientation based on the IMU data
         update_ahrs(&bias, &ahrs, accelerometer_data, gyroscope_data, magnetometer_data, euler_orientation, deltaTime);
 
-//        uint32_t ahrs_count = TIM5->CNT;
+        // Readout ADC
+        HAL_ADC_Start(&hadc1);
+        HAL_ADC_PollForConversion(&hadc1, 1);
+        uint16_t AD_RES = HAL_ADC_GetValue(&hadc1);
+        battery_voltage = AD_RES * ADC_CONSTANT;
 
-        ///////////////////// First sync point
+        ///////////////////// First sync point - wait for the motor position and velocity estimates to finish reading out
         HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_RESET);
 
         uint32_t timer9 = TIM9->CNT;
@@ -364,83 +416,154 @@ int main(void)
             continue;
         }
 
+        // Postprocess and copy the motor position and velocity estimates
+        calculate_estimates(position_estimates, velocity_estimates, CAN_Received_Datas);
+
         HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
 
-//        HAL_Delay(1);
-//        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);
-
-        sync1_time = TIM5->CNT;
-
-
+        // Calculate the endpoint location and velocities and the torque
         update_endpoints(4, position_estimates, velocity_estimates, forces);
+        check_endpoint_limits(&estop);
 
-        can_packet.RTR = 0;
-        can_packet.data_size = 4;
-        can_packet.id = 0xe;
+        // Calculate new footstep landing positions if fsd == -1
+//        euler_orientation[2] = M_PI_4;
+//        foot_scheduler_diff[0] = -1;
+//        foot_scheduler_diff[1] = -1;
+//        foot_scheduler_diff[2] = -1;
+//        foot_scheduler_diff[3] = -1;
+//        body_velocity_estimate[0] = 0.5;
+//        body_velocity_estimate[1] = 0.2;
+//        body_velocity_estimate[2] = 0;
+//        omega[2] = 0.25;
 
-        send_command_data(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &TxHeader, torques);
+        if((foot_scheduler_diff[0] == -1 || foot_scheduler_diff[1] == -1 || foot_scheduler_diff[2] == -1 || foot_scheduler_diff[3] == -1) && new_calculated_data_received && control_mode == CONTROL_MODE_TORQUE){
+            body_velocity_estimate[0] = 0.5;
+            generate_footstep_landing_location(body_velocity_estimate, foot_scheduler_diff, foot_step_landing_locations, shoulder_vectors, euler_orientation[2], omega[2], 0.3);
+            generate_lift_leg_trajectory(foot_scheduler_diff, foot_step_landing_locations, endpoints, lift_leg_trajectory, lift_leg_trajectory_angles);
+            TIM2->CNT = 0;
+            lift_leg_index = 0;
+            lift_leg_timer_counter = 0;
+        }
 
-//        HAL_Delay(1);
-//        continue;
+        uint32_t lift_leg_timer = TIM2->CNT;
+        if(lift_leg_timer >= lift_leg_timer_counter) {
+            lift_leg_index += 1;
+            lift_leg_timer_counter += 20000;
+            update_position_targets = 1;
+        }
 
-        step(euler_orientation, fs, var_R, var_V, endpoints, endpoints_velocity);
+        // If we don't run performance mode, we need to readout also the torques from the controllers
+        performance_mode = 1;
+        if(!performance_mode){
+            estimates_flag = 0;
 
-        TX_Data_t data = {.accel_x = accelerometer_data[0],
-                          .accel_y = accelerometer_data[1],
-                          .accel_z = accelerometer_data[2],
+            can_packet_estimates.id = 0x14;
+            can_packet_estimates.RTR = 0x1;
+            can_packet_estimates.data_size = 0x8;
 
-                          .gyro_x = gyroscope_data[0],
-                          .gyro_y = gyroscope_data[1],
-                          .gyro_z = gyroscope_data[2],
+            send_can_command_to_all_controllers(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_estimates, &TxHeader, &CAN_TxData, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes, &htim3);
+            hfdcan1.Instance->TXBAR = 0x00000003;
+            hfdcan2.Instance->TXBAR = 0x00000003;
+            hfdcan3.Instance->TXBAR = 0x00000003;
 
-                          .mag_x = magnetometer_data[0],
-                          .mag_y = magnetometer_data[1],
-                          .mag_z = magnetometer_data[2],
+            while(estimates_flag == 0){
+                timer9 = TIM9->CNT;
+                if(timer9 > 2000){
+                    break;
+                }
+                continue;
+            }
+        }
 
-                          .euler_x = euler_orientation[0],
-                          .euler_y = euler_orientation[1],
-                          .euler_z = euler_orientation[2],
+        // Send either position or torque inputs
+        if(parsed_control_mode == CONTROL_MODE_TORQUE) {
+            float32_t torques[] = {0,0,0,0,0,0,0,0,0,0,0,0};
+            send_torque_position(&hfdcan1, &hfdcan2, &hfdcan3, &TxHeader, torques, lift_leg_trajectory_angles[lift_leg_index], foot_scheduler, update_position_targets, lift_leg_trajectory_angles[lift_leg_index]);
+        }
+        else if (parsed_control_mode == CONTROL_MODE_POSITION){
+            send_positions(&hfdcan1, &hfdcan2, &hfdcan3, &TxHeader, position_targets);
+        }
 
-                          .mag_temp = mag_temp,
-                          .timestamp = timestamp};
+        // Update data based on calculations
+        update_data_structure();
 
-        memcpy(&data.endpoints, &endpoints, sizeof(float32_t)*12);
-        memcpy(&data.leg_angles, &position_estimates, sizeof(float32_t)*12);
-
-        memcpy(&data.can_data_low, &CAN_Received_Datas, sizeof(uint32_t)*12);
-        memcpy(&data.can_data_high, &CAN_Received_Datas[12], sizeof(uint32_t)*12);
-
+        // Send telemetry and receive control data
         send_telemetry(&hspi1, &data, sizeof(data), TX_Buffer_1, RX_Buffer_1);
 
-//        HAL_Delay(1);
+
+        wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);
+
+//        parsed_control_mode = 3;
 
 
-        if (status != HAL_OK) {
-            /* Transmission request Error */
-            Error_Handler();
-        }
-
-        HAL_ADC_Start(&hadc1);
-        HAL_ADC_PollForConversion(&hadc1, 1);
-        uint16_t AD_RES = HAL_ADC_GetValue(&hadc1);
-        battery_voltage = AD_RES * ADC_CONSTANT;
-
-//        HAL_Delay(1);
-
-//        uint32_t current_time = TIM5->CNT;
-//        while(current_time < 12000){
-//            current_time = TIM5->CNT;
+        // Check if CONTROL_MODE has changed, if so send a CAN message to the controllers
+//        can_packet_command.RTR = 0;
+//        if((parsed_control_mode != control_mode) && (parsed_control_mode == CONTROL_MODE_TORQUE || parsed_control_mode == CONTROL_MODE_POSITION)){
+//
+//            can_packet_command.data_size = 0x8;//parsed_data_size;
+//            can_packet_command.id = 0xb;//parsed_command;
+//            control_mode = parsed_control_mode;
+//            for(uint8_t i=0; i<12; i++){
+//                CAN_Command_Datas[i*2] = (uint32_t) control_mode;
+//                CAN_Command_Datas[i*2+1] = (uint32_t) parsed_input_mode;
+//            }
+//
+//            send_command_data(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_command, &TxHeader, &CAN_Command_Datas);
+//            wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
 //        }
-        uint32_t pending1 = hfdcan1.Instance->TXBRP;
-        uint32_t pending2 = hfdcan2.Instance->TXBRP;
-        uint32_t pending3 = hfdcan3.Instance->TXBRP;
 
-        while(pending1 || pending2 || pending3){
-            pending1 = hfdcan1.Instance->TXBRP;
-            pending2 = hfdcan2.Instance->TXBRP;
-            pending3 = hfdcan3.Instance->TXBRP;
+
+        can_packet_command.RTR = 0;
+        if(parsed_control_mode == CONTROL_MODE_TORQUE){
+            control_mode = parsed_control_mode;
+            send_control_modes_for_torque_mode(&hfdcan1, &hfdcan2, &hfdcan3, &TxHeader, foot_scheduler_diff);
+            wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
+        } else if (parsed_control_mode == CONTROL_MODE_POSITION && parsed_control_mode != control_mode){
+            control_mode = parsed_control_mode;
+            send_control_modes_for_position_mode(&hfdcan1, &hfdcan2, &hfdcan3, &TxHeader);
+            wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
         }
 
+//        parsed_axis_state = 1;
+        // Check if AXIS_STATE has changed, if so send a CAN message to the controllers
+        can_packet_command.RTR = 0;
+        if(((parsed_axis_state != axis_state) && (parsed_axis_state == AXIS_STATE_CLOSED_LOOP || parsed_axis_state == AXIS_STATE_IDLE)) || estop){
+
+            can_packet_command.data_size = 0x4;//parsed_data_size;
+            can_packet_command.id = 0x7;//parsed_command;
+            axis_state = parsed_axis_state;
+            if(estop){
+                axis_state = AXIS_STATE_IDLE;
+            }
+            for(uint8_t i=0; i<12; i++){
+                CAN_Command_Datas[i] = (uint32_t) axis_state;
+            }
+
+            send_command_data(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_command, &TxHeader, &CAN_Command_Datas);
+            wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
+        }
+
+        wait_until_no_pending_messages(&hfdcan1, &hfdcan2, &hfdcan3);
+
+//        if(heartbeat_receive_counter >= 42){
+//            control_mode = 0;
+//            axis_state = 0;
+//            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
+////            TIM9->CNT = 0;
+////            timer9 = 0;
+////            while(timer9 < 400){
+////                timer9 = TIM9->CNT;
+////            }
+//            heartbeat_receive_counter = 0;
+//
+//        }
+//        else{
+//            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
+//            heartbeat_receive_counter += 1;
+//        }
+
+        // Poll IMU to check if there is new data available
         uint32_t flags = poll_for_imu_new_data(&hspi5, TX_Buffer, RX_Buffer);
         while(flags < 3){
             flags = poll_for_imu_new_data(&hspi5, TX_Buffer, RX_Buffer);
@@ -1026,7 +1149,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 32;
+  htim2.Init.Prescaler = 399;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -1184,6 +1307,44 @@ static void MX_TIM5_Init(void)
   /* USER CODE BEGIN TIM5_Init 2 */
 
   /* USER CODE END TIM5_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 32;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
@@ -1397,113 +1558,159 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void update_data_structure(){
+
+    memcpy(&data.orientation, &euler_orientation, sizeof(float32_t)*3);
+    memcpy(&data.omega, &omega, sizeof(double_t)*3);
+    memcpy(&data.acceleration, &acceleration, sizeof(double_t)*3);
+
+    memcpy(&data.leg_angles, &position_estimates, sizeof(float32_t)*12);
+
+    memcpy(&data.endpoints, &endpoints, sizeof(float32_t)*12);
+    memcpy(&data.endpoints_velocity, &endpoints_velocity, sizeof(float32_t)*12);
+
+    memcpy(&data.can_data_low, &CAN_Received_Datas, sizeof(uint32_t)*12);
+    memcpy(&data.can_data_high, &CAN_Received_Datas[12], sizeof(uint32_t)*12);
+
+    memcpy(&data.magnetometer_data, &magnetometer_data, sizeof(int16_t)*3);
+
+    memcpy(&data.error_codes, &error_codes, sizeof(uint32_t)*12);
+
+    data.deltaTime = deltaTime;
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim){
     if (htim == &htim3) {
         switch (can_state_machine){
-            case 0:
-              hfdcan1.Instance->TXBAR = 0x00000003;
-              hfdcan2.Instance->TXBAR = 0x00000003;
-              hfdcan3.Instance->TXBAR = 0x00000003;
-              can_state_machine += 1;
-              TIM3->CNT = 1;
-              TIM3->SR &= ~TIM_SR_UIF;
-              HAL_TIM_Base_Start_IT(htim);
-              HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
-              break;
+        case 0:
+            hfdcan1.Instance->TXBAR = 0x00000003;
+            hfdcan2.Instance->TXBAR = 0x00000003;
+            hfdcan3.Instance->TXBAR = 0x00000003;
+            can_state_machine += 1;
+            TIM3->CNT = 1;
+            TIM3->SR &= ~TIM_SR_UIF;
+            HAL_TIM_Base_Start_IT(htim);
+//            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
+            break;
 
-            case 1:
-              hfdcan1.Instance->TXBAR = 0x0000000c;
-              hfdcan2.Instance->TXBAR = 0x0000000c;
-              hfdcan3.Instance->TXBAR = 0x0000000c;
-              can_state_machine = 4;
-              TIM3->CNT = 1;
-              TIM3->SR &= ~TIM_SR_UIF;
-              HAL_TIM_Base_Start_IT(htim);
-              HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
-              break;
+        case 1:
+            hfdcan1.Instance->TXBAR = 0x0000000c;
+            hfdcan2.Instance->TXBAR = 0x0000000c;
+            hfdcan3.Instance->TXBAR = 0x0000000c;
+            can_state_machine = 4;
+            TIM3->CNT = 1;
+            TIM3->SR &= ~TIM_SR_UIF;
+            HAL_TIM_Base_Start_IT(htim);
+//            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
+            break;
 
-            case 2:
-              hfdcan1.Instance->TXBAR = 0x00000004;
-              hfdcan2.Instance->TXBAR = 0x00000004;
-              hfdcan3.Instance->TXBAR = 0x00000004;
-              can_state_machine += 1;
-              TIM3->CNT = 1;
-              TIM3->SR &= ~TIM_SR_UIF;
-              HAL_TIM_Base_Start_IT(htim);
-              break;
+        case 2:
+            hfdcan1.Instance->TXBAR = 0x00000004;
+            hfdcan2.Instance->TXBAR = 0x00000004;
+            hfdcan3.Instance->TXBAR = 0x00000004;
+            can_state_machine += 1;
+            TIM3->CNT = 1;
+            TIM3->SR &= ~TIM_SR_UIF;
+            HAL_TIM_Base_Start_IT(htim);
+            break;
 
-            case 3:
-              hfdcan1.Instance->TXBAR = 0x00000008;
-              hfdcan2.Instance->TXBAR = 0x00000008;
-              hfdcan3.Instance->TXBAR = 0x00000008;
-              can_state_machine += 1;
-              TIM3->CNT = 1;
-              TIM3->SR &= ~TIM_SR_UIF;
-              HAL_TIM_Base_Start_IT(htim);
+        case 3:
+            hfdcan1.Instance->TXBAR = 0x00000008;
+            hfdcan2.Instance->TXBAR = 0x00000008;
+            hfdcan3.Instance->TXBAR = 0x00000008;
+            can_state_machine += 1;
+            TIM3->CNT = 1;
+            TIM3->SR &= ~TIM_SR_UIF;
+            HAL_TIM_Base_Start_IT(htim);
 
-              break;
+            break;
 
-            case 4:
-                can_timeout_flags = wait_and_receive_packets(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes);
-                can_state_machine = 1;
-                TIM3->SR &= ~TIM_SR_UIF;
-                HAL_TIM_Base_Stop_IT(htim);
-                calculate_estimates(position_estimates, velocity_estimates, CAN_Received_Datas);
-                estimates_flag = 1;
-                HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
-                break;
+        case 4:
+            can_timeout_flags = wait_and_receive_packets(&hfdcan1, &hfdcan2, &hfdcan3, &can_packet_estimates, &RxHeader, CAN_RxData, CAN_Received_Datas, error_codes);
+            can_state_machine = 1;
+            TIM3->SR &= ~TIM_SR_UIF;
+            HAL_TIM_Base_Stop_IT(htim);
+            estimates_flag = 1;
+//            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
+            break;
         }
     }
 }
 
 void cache_clean(void *addr, size_t size)
 {
-  uint32_t start = (uint32_t)addr & ~31;
-  uint32_t end   = ((uint32_t)addr + size + 31) & ~31;
-  SCB_CleanDCache_by_Addr((uint32_t*)start, end - start);
+    uint32_t start = (uint32_t)addr & ~31;
+    uint32_t end   = ((uint32_t)addr + size + 31) & ~31;
+    SCB_CleanDCache_by_Addr((uint32_t*)start, end - start);
 }
 
 void cache_invalidate(void *addr, size_t size)
 {
-  uint32_t start = (uint32_t)addr & ~31;
-  uint32_t end   = ((uint32_t)addr + size + 31) & ~31;
-  SCB_InvalidateDCache_by_Addr((uint32_t*)start, end - start);
+    uint32_t start = (uint32_t)addr & ~31;
+    uint32_t end   = ((uint32_t)addr + size + 31) & ~31;
+    SCB_InvalidateDCache_by_Addr((uint32_t*)start, end - start);
 }
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hspi) {
     if (hspi == &hspi1){
         HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);
-        cache_invalidate(RX_Buffer_1, 256);
-        parse_input_can_command(RX_Buffer_1, &can_packet);
+        cache_invalidate(RX_Buffer_1, 512);
+        parse_input_can_command(RX_Buffer_1);
     }
     return;
 }
 
 void send_telemetry(void *handle, TX_Data_t *data, uint32_t data_size, uint8_t *TX_Buffer_1, uint8_t *RX_Buffer_1) {
     memcpy(TX_Buffer_1, data, data_size);
-    cache_clean(TX_Buffer_1, 256);
+    cache_clean(TX_Buffer_1, 512);
     HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_SET);
-//    HAL_SPI_TransmitReceive(handle, TX_Buffer_1, RX_Buffer_1, data_size, 1);
     HAL_SPI_TransmitReceive_DMA(handle, TX_Buffer_1, RX_Buffer_1, data_size);
 }
 
-void receive_input_can_command(void *handle, uint8_t *TX_Buffer_1, uint8_t *RX_Buffer_1, CAN_Packet *can_packet) {
-    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_SET);
-    HAL_SPI_TransmitReceive(handle, TX_Buffer_1, RX_Buffer_1, 10, 1);
-    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);
-    parse_input_can_command(RX_Buffer_1, can_packet);
-}
+//void receive_input_can_command(void *handle, uint8_t *TX_Buffer_1, uint8_t *RX_Buffer_1, CAN_Packet *can_packet) {
+//    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_SET);
+//    HAL_SPI_TransmitReceive(handle, TX_Buffer_1, RX_Buffer_1, 10, 1);
+//    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_6, GPIO_PIN_RESET);
+//    parse_input_can_command(RX_Buffer_1, can_packet);
+//}
 
-void parse_input_can_command(uint8_t RX_Buffer_1[], CAN_Packet *can_packet) {
-    can_packet->RTR = ((RX_Buffer_1[0]) & 0x80) >> 7;
-    can_packet->id = (RX_Buffer_1[0]) & 0x1f;
-    can_packet->data_size = (RX_Buffer_1[1]);
-    memcpy(can_packet->data_buffer, &RX_Buffer_1[2], can_packet->data_size);
-    if (can_packet->id > 2){
-        send_can_command_flag = 1;
-    }
-    else{
-        send_can_command_flag = 0;
+void parse_input_can_command(uint8_t RX_Buffer_1[]) {
+    uint8_t sync_word = RX_Buffer_1[0];
+
+    if (sync_word != 0xaa){
+        performance_mode = 0;
+        parsed_command = 0xe;
+        parsed_data_size = 4;
+        parsed_control_mode = CONTROL_MODE_POSITION;
+        parsed_axis_state = AXIS_STATE_IDLE;
+        for(uint8_t i=0; i<24; i++){
+            CAN_Command_Datas[i] = 0;
+        }
+
+    } else {
+        performance_mode = RX_Buffer_1[1];
+        parsed_command = RX_Buffer_1[2];
+        parsed_data_size = RX_Buffer_1[3];
+        parsed_control_mode = RX_Buffer_1[4] & 0xf;
+        parsed_input_mode = (RX_Buffer_1[4] >> 4) & 0xf;
+        parsed_axis_state = RX_Buffer_1[5];
+
+        memcpy(foot_scheduler, &RX_Buffer_1[6], 4);
+        memcpy(foot_scheduler_diff, &RX_Buffer_1[10], 4);
+
+        new_calculated_data_received = RX_Buffer_1[14];
+//        if (new_calculated_data_counter < 100){
+//            new_calculated_data_buffer[new_calculated_data_counter++] = new_calculated_data_received;
+//        }
+        memcpy(body_velocity_estimate, &RX_Buffer_1[15], 12);
+
+        if(parsed_control_mode == CONTROL_MODE_TORQUE){
+            memcpy(forces, &RX_Buffer_1[27], 12*4);
+        } else{
+            for(uint8_t i=0; i<12; i++){
+                memcpy(&position_targets[i*2], &RX_Buffer_1[27+i*4], 4);
+            }
+        }
     }
 }
 
@@ -1514,13 +1721,13 @@ void initialize_ahrs(FusionBias *bias, FusionAhrs *ahrs) {
 }
 
 void update_ahrs(FusionBias *bias, FusionAhrs *ahrs, int16_t accelerometer_data[], int16_t gyroscope_data[], int16_t magnetometer_data[],
-                 float_t euler_orientation[], float_t deltaTime) {
+        float_t euler_orientation[], float_t deltaTime) {
 
     FusionVector gyroscope = {{gyroscope_data[0] * GYROSCOPE_CONSTANT, gyroscope_data[1] * GYROSCOPE_CONSTANT, gyroscope_data[2] * GYROSCOPE_CONSTANT}};
     FusionVector accelerometer = {{accelerometer_data[0] * ACCELEROMETER_CONSTANT, accelerometer_data[1] * ACCELEROMETER_CONSTANT,
-                                  accelerometer_data[2] * ACCELEROMETER_CONSTANT}};
+            accelerometer_data[2] * ACCELEROMETER_CONSTANT}};
     FusionVector magnetometer = {{magnetometer_data[0] * -MAGNETOMETER_CONSTANT, magnetometer_data[1] * MAGNETOMETER_CONSTANT,
-                                 magnetometer_data[2] * MAGNETOMETER_CONSTANT}};
+            magnetometer_data[2] * MAGNETOMETER_CONSTANT}};
 
     gyroscope = FusionModelInertial(gyroscope, gyroscopeMisalignment, gyroscopeSensitivity, gyroscopeOffset);
 
@@ -1534,14 +1741,14 @@ void update_ahrs(FusionBias *bias, FusionAhrs *ahrs, int16_t accelerometer_data[
 
     const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(ahrs));
 
-//    const FusionVector earth = FusionAhrsGetEarthAcceleration(ahrs);
+    //    const FusionVector earth = FusionAhrsGetEarthAcceleration(ahrs);
 
     memcpy(euler_orientation, euler.array, sizeof(float) * 3);
 }
 
 void readout_imu(void* spi_handle, uint8_t* TX_Buffer, uint8_t* RX_Buffer, int16_t* accelerometer_data, int16_t* gyroscope_data, int16_t* magnetometer_data, uint32_t* previousTimestamp, uint32_t* timestamp, float_t* deltaTime, int16_t* mag_temp){
     TX_Buffer[0] = 0xf;
-    cache_clean(TX_Buffer, 16);
+//    cache_clean(TX_Buffer, 16);
     read_imu_fd(spi_handle, LSM6DSO_OUTX_L_G, &TX_Buffer[0], &RX_Buffer[0], 12);
 
     gyroscope_data[0] = RX_Buffer[0] + (RX_Buffer[1] << 8);
@@ -1552,6 +1759,14 @@ void readout_imu(void* spi_handle, uint8_t* TX_Buffer, uint8_t* RX_Buffer, int16
     accelerometer_data[1] = RX_Buffer[8] + (RX_Buffer[9] << 8);
     accelerometer_data[2] = RX_Buffer[10] + (RX_Buffer[11] << 8);
 
+    acceleration[0] = accelerometer_data[0] * ACCELEROMETER_CONSTANT;
+    acceleration[1] = accelerometer_data[1] * ACCELEROMETER_CONSTANT;
+    acceleration[2] = accelerometer_data[2] * ACCELEROMETER_CONSTANT;
+
+    omega[0] = gyroscope_data[0] * GYROSCOPE_CONSTANT;
+    omega[1] = gyroscope_data[1] * GYROSCOPE_CONSTANT;
+    omega[2] = gyroscope_data[2] * GYROSCOPE_CONSTANT;
+
     read_imu_fd(spi_handle, LSM6DSO_TIMESTAMP0, &TX_Buffer[0], &RX_Buffer[0], 4);
 
     *previousTimestamp = *timestamp;
@@ -1560,16 +1775,16 @@ void readout_imu(void* spi_handle, uint8_t* TX_Buffer, uint8_t* RX_Buffer, int16
 
     read_mag_fd(spi_handle, LIS2MDL_STATUS_REG, &TX_Buffer[0], &RX_Buffer[0], 9);
 
-    magnetometer_data[0] = RX_Buffer[1] + (RX_Buffer[2] << 8) - 50;
-    magnetometer_data[1] = RX_Buffer[3] + (RX_Buffer[4] << 8) + 200;
+    magnetometer_data[0] = RX_Buffer[1] + (RX_Buffer[2] << 8) + 95;
+    magnetometer_data[1] = RX_Buffer[3] + (RX_Buffer[4] << 8) + 90;
     magnetometer_data[2] = RX_Buffer[5] + (RX_Buffer[6] << 8) - 250;
     *mag_temp = (RX_Buffer[7] + (RX_Buffer[8] << 8)) / 8;
-    cache_invalidate(RX_Buffer, 16);
+//    cache_invalidate(RX_Buffer, 16);
 }
 
 uint8_t poll_for_imu_new_data(void* spi_handle, uint8_t* TX_Buffer, uint8_t* RX_Buffer){
 
-//    read_imu_fd(spi_handle, LSM6DSO_OUTX_L_G, &TX_Buffer[0], &RX_Buffer[0], 1);
+    //    read_imu_fd(spi_handle, LSM6DSO_OUTX_L_G, &TX_Buffer[0], &RX_Buffer[0], 1);
 
     uint8_t reg = LSM6DSO_STATUS_REG | 0x80;
     TX_Buffer[0] = reg;
@@ -1583,13 +1798,11 @@ uint8_t poll_for_imu_new_data(void* spi_handle, uint8_t* TX_Buffer, uint8_t* RX_
     return return_flags;
 }
 
-
-
 void timer_wait(void) {
     uint32_t start;
-    start = TIM2->CNT;
+    start = TIM6->CNT;
     while (1) {
-        if (TIM2->CNT - start >= CLK_WAIT) {
+        if (TIM6->CNT - start >= CLK_WAIT) {
             break;
         }
     }
@@ -1597,9 +1810,9 @@ void timer_wait(void) {
 
 void timer_wait2(uint16_t clks) {
     uint32_t timer2 = 0;
-    TIM2->CNT = 0;
+    TIM6->CNT = 0;
     while (timer2 < clks) {
-        timer2 = TIM2->CNT;
+        timer2 = TIM6->CNT;
     }
 }
 
@@ -1714,7 +1927,7 @@ void read_mag_fd(void *handle, uint8_t reg, uint8_t *buft, uint8_t *bufr, uint16
     buft[0] = reg;
     buft[1] = 0;
     HAL_GPIO_WritePin(MAG_CS_BANK, MAG_CS_PIN, GPIO_PIN_RESET);
-    HAL_SPI_TransmitReceive_DMA(handle, buft, bufr, len + 1);
+    HAL_SPI_TransmitReceive(handle, buft, bufr, len + 1, 1000);
     HAL_GPIO_WritePin(MAG_CS_BANK, MAG_CS_PIN, GPIO_PIN_SET);
     for (int i = 0; i < len + 1; ++i) {
         bufr[i] = bufr[i + 1];

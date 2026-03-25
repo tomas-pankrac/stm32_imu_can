@@ -8,12 +8,60 @@
 #include "can_functions.h"
 // #include "main.h"
 
-const float32_t angle_multiplier[12] = {-2 * PI / 6.0, -2 * PI / 6.0, -2 * PI / 6.0025, 2 * PI / 6.0, -2 * PI / 6.0, -2 * PI / 6.0025,
-                                        -2 * PI / 6.0, 2 * PI / 6.0,  2 * PI / 6.0025,  2 * PI / 6.0, 2 * PI / 6.0,  2 * PI / 6.0025};
+const float32_t angle_multiplier[12] = {
+        -2 * PI / 6.0,
+        -2 * PI / 6.0,
+        -2 * PI / 6.0025,
+        2 * PI / 6.0,
+        -2 * PI / 6.0,
+        -2 * PI / 6.0025,
+        -2 * PI / 6.0,
+        2 * PI / 6.0,
+        2 * PI / 6.0025,
+        2 * PI / 6.0,
+        2 * PI / 6.0,
+        2 * PI / 6.0025};
 
 const float32_t angle_multiplier2[12] = {-1, -1, -1, 1, -1, -1, -1, 1, 1, 1, 1, 1};
 
-const int32_t calibration_values[12] = {14711, 378, 16320, 11020, 3959, 8364, 3546, 10868, 11109, 5946, 10770, 5026};
+const int32_t calibration_values[12] = {14502, 378, 16320, 15500, 3959, 8364, 7521, 10868, 11109, 14839, 10770, 5026};
+
+void reboot_odrives(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3, FDCAN_TxHeaderTypeDef *TxHeader, void *dataToSend){
+
+    uint8_t command = 0x16;
+    uint8_t data_size = 0;
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, dataToSend + 0 *data_size, 0 , command,  data_size, 1 << 0);
+    send_can_data_frame_buffer(can_handle1, TxHeader, dataToSend + 3 *data_size, 3 , command,  data_size, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle2, TxHeader, dataToSend + 1 *data_size, 1 , command,  data_size, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, dataToSend + 7 *data_size, 7 , command,  data_size, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle3, TxHeader, dataToSend + 4 *data_size, 4 , command,  data_size, 1 << 0);
+    send_can_data_frame_buffer(can_handle3, TxHeader, dataToSend + 10*data_size, 10, command,  data_size, 1 << 1);
+
+    uint8_t cnt = 0;
+    TIM4->CNT = 0;
+    while (cnt < 10) {
+        cnt = TIM4->CNT;
+    }
+
+    can_handle1->Instance->TXBAR = 0x00000003;
+    can_handle2->Instance->TXBAR = 0x00000003;
+    can_handle3->Instance->TXBAR = 0x00000003;
+
+    uint32_t pending1 = can_handle1->Instance->TXBRP;
+    uint32_t pending2 = can_handle2->Instance->TXBRP;
+    uint32_t pending3 = can_handle3->Instance->TXBRP;
+
+    while(pending1 || pending2 || pending3){
+        pending1 = can_handle1->Instance->TXBRP;
+        pending2 = can_handle2->Instance->TXBRP;
+        pending3 = can_handle3->Instance->TXBRP;
+    }
+
+    HAL_Delay(3000);
+}
 
 uint8_t run_leg_angle_calibration(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3,
                                CAN_Packet *can_packet, FDCAN_TxHeaderTypeDef *TxHeader, void* TxData, FDCAN_RxHeaderTypeDef *RxHeader,
@@ -23,31 +71,71 @@ uint8_t run_leg_angle_calibration(FDCAN_HandleTypeDef *can_handle1, FDCAN_Handle
     can_packet->id = 0xa;
     can_packet->data_size = 8;
 
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);
+
     uint8_t timed_out = 0;
+    int32_t angles[10][12];
+    float32_t average_angle_float;
+    int32_t average_angle_int;
+
+    for(uint8_t i=0; i<10; i++){
+        for(uint8_t j=0; j<12; j++){
+            angles[i][j] = 0;
+        }
+    }
+
+//    uint8_t count_messages1 = HAL_FDCAN_GetRxFifoFillLevel(can_handle1, FDCAN_RX_FIFO0);
+//    uint8_t count_messages2 = HAL_FDCAN_GetRxFifoFillLevel(can_handle2, FDCAN_RX_FIFO0);
+//    uint8_t count_messages3 = HAL_FDCAN_GetRxFifoFillLevel(can_handle3, FDCAN_RX_FIFO0);
+//
+//    // Wait for heartbeat messages before beginning
+//    while(count_messages1 == 0 || count_messages2 == 0 || count_messages3 == 0){
+//        count_messages1 = HAL_FDCAN_GetRxFifoFillLevel(can_handle1, FDCAN_RX_FIFO0);
+//        count_messages2 = HAL_FDCAN_GetRxFifoFillLevel(can_handle2, FDCAN_RX_FIFO0);
+//        count_messages3 = HAL_FDCAN_GetRxFifoFillLevel(can_handle3, FDCAN_RX_FIFO0);
+//    }
 
     int32_t current_count = 0;
-//    float32_t current_angle = 0;
     int32_t diff = 0;
+
+    // Flush input FIFOs
     receive_can_data_frame(can_handle1, RxHeader, CAN_RxData, CAN_Received_Datas, 0xff, error_codes);
     receive_can_data_frame(can_handle2, RxHeader, CAN_RxData, CAN_Received_Datas, 0xff, error_codes);
     receive_can_data_frame(can_handle3, RxHeader, CAN_RxData, CAN_Received_Datas, 0xff, error_codes);
 
-    timed_out = send_can_command_to_all_controllers(can_handle1, can_handle2, can_handle3, can_packet, TxHeader, TxData, RxHeader, CAN_RxData,
-                                                    CAN_Received_Datas, error_codes, htim3);
+    uint8_t cnt=0;
 
-    HAL_Delay(20);
+    while(cnt<10){
+        *estimates_flag = 0;
+        timed_out = send_can_command_to_all_controllers(can_handle1, can_handle2, can_handle3, can_packet, TxHeader, TxData, RxHeader, CAN_RxData,
+                CAN_Received_Datas, error_codes, htim3);
+        can_handle1->Instance->TXBAR = 0x00000003;
+        can_handle2->Instance->TXBAR = 0x00000003;
+        can_handle3->Instance->TXBAR = 0x00000003;
 
-    while (*estimates_flag != 1) {
-        continue;
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_RESET);
+
+        while (*estimates_flag != 1) {
+            continue;
+        }
+
+        for (uint8_t i = 0; i < 12; i++) {
+            angles[cnt][i] = CAN_Received_Datas[i + 12];
+        }
+        cnt++;
     }
 
-//    receive_can_data_frame(can_handle1, RxHeader, CAN_RxData, CAN_Received_Datas, 0xa, error_codes);
-//    receive_can_data_frame(can_handle2, RxHeader, CAN_RxData, CAN_Received_Datas, 0xa, error_codes);
-//    receive_can_data_frame(can_handle3, RxHeader, CAN_RxData, CAN_Received_Datas, 0xa, error_codes);
-
     for (uint8_t i = 0; i < 12; i++) {
-        current_count = CAN_Received_Datas[i + 12];
+        average_angle_float = 0;
+        for(uint8_t j=0; j<10; j++){
+            average_angle_float += angles[j][i]/10.0;
+        }
+
+        average_angle_int = (int32_t)roundf(average_angle_float);
+
+        current_count = average_angle_int;
         diff = current_count - calibration_values[i];
+
         if (diff > 8192) {
             current_count -= 16384;
         } else if (diff < -8192) {
@@ -216,6 +304,210 @@ void send_command_data(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *ca
         cnt = TIM4->CNT;
     }
 
+    can_handle1->Instance->TXBAR = 0x0000000f;
+    can_handle2->Instance->TXBAR = 0x0000000f;
+    can_handle3->Instance->TXBAR = 0x0000000f;
+
+}
+
+void send_torque_position(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3,
+        FDCAN_TxHeaderTypeDef *TxHeader, float32_t torques[], float32_t positions[], uint8_t foot_scheduler[], uint8_t update_position_targets, float32_t position_targets[]){
+
+    if (foot_scheduler[0]==1){ // send torques to leg i
+
+        send_can_data_frame_buffer(can_handle1, TxHeader, &torques[0], 0, COMMAND_SET_INPUT_TORQUE,  4, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &torques[1], 1, COMMAND_SET_INPUT_TORQUE,  4, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &torques[2], 2, COMMAND_SET_INPUT_TORQUE,  4, 1 << 1);
+    } else if (update_position_targets) {
+
+        for (uint8_t i=0; i<3; i++){
+            memcpy(&position_targets[i*2], &positions[0], 4);
+        }
+        send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[0], 0, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[1], 1, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[2], 2, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+    }
+    if (foot_scheduler[1]==1){ // send torques to leg i
+
+        send_can_data_frame_buffer(can_handle1, TxHeader, &torques[3], 3, COMMAND_SET_INPUT_TORQUE, 4, 1 << 1);
+        send_can_data_frame_buffer(can_handle3, TxHeader, &torques[4], 4, COMMAND_SET_INPUT_TORQUE, 4, 1 << 0);
+        send_can_data_frame_buffer(can_handle3, TxHeader, &torques[5], 5, COMMAND_SET_INPUT_TORQUE, 4, 1 << 1);
+    } else if (update_position_targets) {
+
+        for (uint8_t i=3; i<6; i++){
+            memcpy(&position_targets[i*2], &positions[3], 4);
+        }
+        send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[3], 3, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[4], 4, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[5], 5, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+    }
+    if (foot_scheduler[2]==1){ // send torques to leg i
+
+        send_can_data_frame_buffer(can_handle1, TxHeader, &torques[6], 6, COMMAND_SET_INPUT_TORQUE,  4, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &torques[7], 7, COMMAND_SET_INPUT_TORQUE,  4, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &torques[8], 8, COMMAND_SET_INPUT_TORQUE,  4, 1 << 3);
+    } else if (update_position_targets) {
+
+        for (uint8_t i=6; i<9; i++){
+            memcpy(&position_targets[i*2], &positions[6], 4);
+        }
+        send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[6], 6, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[7], 7, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[8], 8, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+    }
+    if (foot_scheduler[2]==1){ // send torques to leg i
+
+        send_can_data_frame_buffer(can_handle1, TxHeader, &torques[9] ,  9, COMMAND_SET_INPUT_TORQUE,  4, 1 << 3);
+        send_can_data_frame_buffer(can_handle3, TxHeader, &torques[10], 10, COMMAND_SET_INPUT_TORQUE,  4, 1 << 2);
+        send_can_data_frame_buffer(can_handle3, TxHeader, &torques[11], 11, COMMAND_SET_INPUT_TORQUE,  4, 1 << 3);
+    } else if (update_position_targets) {
+
+        for (uint8_t i=9; i<12; i++){
+            memcpy(&position_targets[i*2], &positions[9], 4);
+        }
+        send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[9] ,  9, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[10], 10, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[11], 11, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+    }
+
+    uint8_t cnt = 0;
+    TIM4->CNT = 0;
+    while (cnt < 10) {
+        cnt = TIM4->CNT;
+    }
+
+    can_handle1->Instance->TXBAR = 0x0000000f;
+    can_handle2->Instance->TXBAR = 0x0000000f;
+    can_handle3->Instance->TXBAR = 0x0000000f;
+}
+
+void send_positions(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3,
+        FDCAN_TxHeaderTypeDef *TxHeader, float32_t position_targets[]){
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[0], 0, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[1], 1, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[2], 2, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[3], 3, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[4], 4, COMMAND_SET_INPUT_POSITION,  8, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[5], 5, COMMAND_SET_INPUT_POSITION,  8, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[6], 6, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[7], 7, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[8], 8, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, &position_targets[9] ,  9, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[10], 10, COMMAND_SET_INPUT_POSITION,  8, 1 << 2);
+    send_can_data_frame_buffer(can_handle2, TxHeader, &position_targets[11], 11, COMMAND_SET_INPUT_POSITION,  8, 1 << 3);
+
+    uint8_t cnt = 0;
+    TIM4->CNT = 0;
+    while (cnt < 10) {
+        cnt = TIM4->CNT;
+    }
+
+    can_handle1->Instance->TXBAR = 0x0000000f;
+    can_handle2->Instance->TXBAR = 0x0000000f;
+    can_handle3->Instance->TXBAR = 0x0000000f;
+
+}
+
+void send_control_modes_for_torque_mode(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3,
+        FDCAN_TxHeaderTypeDef *TxHeader, int8_t foot_scheduler_diff[]){
+
+    int32_t torque_control_data[2];
+    int32_t position_control_data[2];
+
+    torque_control_data[0] = CONTROL_MODE_TORQUE;
+    torque_control_data[1] = INPUT_MODE_PASSTHROUGH;
+
+    position_control_data[0] = CONTROL_MODE_POSITION;
+    position_control_data[1] = INPUT_MODE_PASSTHROUGH;
+
+    if (foot_scheduler_diff[0] == 1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, torque_control_data, 0, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, torque_control_data, 1, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, torque_control_data, 2, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 1);
+
+    } else if (foot_scheduler_diff[0] == -1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 0, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 1, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+        send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 2, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 1);
+    }
+
+    if (foot_scheduler_diff[1] == 1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, torque_control_data, 3, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 1);
+        send_can_data_frame_buffer(can_handle3, TxHeader, torque_control_data, 4, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 0);
+        send_can_data_frame_buffer(can_handle3, TxHeader, torque_control_data, 5, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 1);
+
+    } else if (foot_scheduler_diff[1] == -1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 3, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 1);
+        send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 4, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 0);
+        send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 5, COMMAND_SET_CONTROLLER_MODE, 8, 1 << 1);
+    }
+
+    if (foot_scheduler_diff[2] == 1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, torque_control_data, 4, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, torque_control_data, 5, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, torque_control_data, 6, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+
+    } else  if (foot_scheduler_diff[2] == -1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 4, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 5, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 6, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+    }
+
+    if (foot_scheduler_diff[3] == 1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, torque_control_data, 9 , COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+        send_can_data_frame_buffer(can_handle3, TxHeader, torque_control_data, 10, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle3, TxHeader, torque_control_data, 11, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+
+    } else if (foot_scheduler_diff[3] == -1) {
+        send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 9 , COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+        send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 10, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 2);
+        send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 11, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 3);
+    }
+
+    uint8_t cnt = 0;
+    TIM4->CNT = 0;
+    while (cnt < 10) {
+        cnt = TIM4->CNT;
+    }
+
+    can_handle1->Instance->TXBAR = 0x0000000f;
+    can_handle2->Instance->TXBAR = 0x0000000f;
+    can_handle3->Instance->TXBAR = 0x0000000f;
+}
+
+void send_control_modes_for_position_mode(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3,
+        FDCAN_TxHeaderTypeDef *TxHeader){
+
+    int32_t position_control_data[2];
+
+    position_control_data[0] = CONTROL_MODE_POSITION;
+    position_control_data[1] = INPUT_MODE_PASSTHROUGH;
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 0, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 1, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 0);
+    send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 2, COMMAND_SET_CONTROLLER_MODE,  8, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 3, COMMAND_SET_CONTROLLER_MODE, 4, 1 << 1);
+    send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 4, COMMAND_SET_CONTROLLER_MODE, 4, 1 << 0);
+    send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 5, COMMAND_SET_CONTROLLER_MODE, 4, 1 << 1);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 4, COMMAND_SET_CONTROLLER_MODE,  4, 1 << 2);
+    send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 5, COMMAND_SET_CONTROLLER_MODE,  4, 1 << 2);
+    send_can_data_frame_buffer(can_handle2, TxHeader, position_control_data, 6, COMMAND_SET_CONTROLLER_MODE,  4, 1 << 3);
+
+    send_can_data_frame_buffer(can_handle1, TxHeader, position_control_data, 9 , COMMAND_SET_CONTROLLER_MODE,  4, 1 << 3);
+    send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 10, COMMAND_SET_CONTROLLER_MODE,  4, 1 << 2);
+    send_can_data_frame_buffer(can_handle3, TxHeader, position_control_data, 11, COMMAND_SET_CONTROLLER_MODE,  4, 1 << 3);
+
+    uint8_t cnt = 0;
+    TIM4->CNT = 0;
+    while (cnt < 10) {
+        cnt = TIM4->CNT;
+    }
 
     can_handle1->Instance->TXBAR = 0x0000000f;
     can_handle2->Instance->TXBAR = 0x0000000f;
@@ -288,3 +580,19 @@ void calculate_estimates(float_t position_estimates[], float_t velocity_estimate
         velocity_estimates[node] *= angle_multiplier[node];
     }
 }
+
+void wait_until_no_pending_messages(FDCAN_HandleTypeDef *can_handle1, FDCAN_HandleTypeDef *can_handle2, FDCAN_HandleTypeDef *can_handle3){
+    uint32_t pending1 = can_handle1->Instance->TXBRP;
+    uint32_t pending2 = can_handle2->Instance->TXBRP;
+    uint32_t pending3 = can_handle3->Instance->TXBRP;
+
+    while(pending1 || pending2 || pending3){
+        pending1 = can_handle1->Instance->TXBRP;
+        pending2 = can_handle2->Instance->TXBRP;
+        pending3 = can_handle3->Instance->TXBRP;
+    }
+}
+
+
+
+
